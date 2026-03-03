@@ -1,0 +1,284 @@
+-- ============================================================
+-- WORKFORCE ROW-LEVEL SECURITY VIEW
+-- ============================================================
+-- Version:  FINAL
+-- Platform: Databricks / Delta Lake
+--
+-- Security model: deny-all-by-default
+--
+-- Userrole structure:
+--   email, role, description
+--   managementview  ARRAY<STRING>  (node_ids, ~5 elements, '*' for full access)
+--   country         ARRAY<STRING>
+--   sbmod           ARRAY<STRING>
+--   division        ARRAY<STRING>
+--   jobgroup        ARRAY<STRING>
+--   companycode     ARRAY<STRING>
+--
+-- Two tiers:
+--   Tier 1: Non-manager → membership + dimensional (ARRAY_CONTAINS)
+--   Tier 2: Manager     → membership + 4-level mgmt view + dimensional
+--
+-- Short-circuit strategy:
+--   ARRAY_CONTAINS(array, '*') handles ALL wildcard combinations inline.
+--   No separate paths for prima, partial wildcard, full wildcard etc.
+--   OR evaluation stops at first TRUE — wildcard = 1 comparison.
+--   Specific values = N comparisons. Mixed = some short, some long.
+--   Any combination of wildcards across any columns = handled.
+--
+-- Infrastructure: ZERO additional tables
+-- ============================================================
+
+
+CREATE OR REPLACE VIEW workforce_secured AS
+
+WITH 
+
+-- ============================================================
+-- ROLE FILTER CONFIGURATION
+-- Change these per view. Nothing else changes.
+-- ============================================================
+role_prefixes AS (
+    SELECT prefix FROM (VALUES 
+        ('XXAHR6A'), ('XXAHR6B'), ('XXGBP0A'), ('XXLBP0A'),
+        ('XXINA0A'), ('XXLCB4A'), ('XXMANDA')
+    ) AS t(prefix)
+),
+
+role_exact AS (
+    SELECT role_name FROM (VALUES 
+        ('XXCBP0AC'), ('XXGCB0AJ'), ('XX8001RX'), ('XXCCB4AA'),
+        ('XXCRD2AX'), ('XXCTM3AX'), ('XXGC04AA'), ('XXSMA0AX'),
+        ('XXSW1AX'), ('DEVELOPER'), ('ANALYST')
+    ) AS t(role_name)
+),
+
+-- Manager roles: get additional 4-level restriction
+manager_roles AS (
+    SELECT role_name FROM (VALUES 
+        ('XXAHR6A1'),
+        ('XXAHR6A2'),
+        ('XXMANDAX')
+        -- Add actual manager roles
+    ) AS t(role_name)
+),
+
+
+-- ============================================================
+-- STEP 1: Current user's roles
+-- One row per role, arrays intact, manager flag set
+-- ============================================================
+user_roles AS (
+    SELECT DISTINCT
+        ur.email,
+        ur.role,
+        ur.description AS role_description,
+        ur.managementview,
+        ur.country,
+        ur.sbmod,
+        ur.division,
+        ur.jobgroup,
+        ur.companycode,
+        CASE WHEN mr.role_name IS NOT NULL THEN TRUE ELSE FALSE END AS is_manager
+    FROM securedbt_hr.hr_sec_userrole ur
+    LEFT JOIN manager_roles mr ON ur.role = mr.role_name
+    WHERE ur.email = current_user()
+      AND (
+          ur.role IN (SELECT role_name FROM role_exact)
+          OR EXISTS (
+              SELECT 1 FROM role_prefixes rp 
+              WHERE ur.role LIKE CONCAT(rp.prefix, '%')
+          )
+      )
+),
+
+
+-- ============================================================
+-- TIER 1: Non-manager — unified path with inline short-circuit
+--
+-- Membership: ARRAY_CONTAINS(managementview, '*' or level_node)
+--   '*' → TRUE instantly, all 14 level checks skipped
+--   specific nodes → checks 14 columns, ~5 comparisons each
+--
+-- Dimensional: ARRAY_CONTAINS(column, '*' or value)
+--   '*' → TRUE instantly, value check skipped
+--   specific → checks value against array
+--
+-- Prima, full wildcard, partial wildcard, fully specific
+-- ALL handled by the same query. Zero branching.
+-- ============================================================
+nonmanager_result AS (
+    SELECT 
+        w.*,
+        ur.role,
+        ur.role_description
+    FROM user_roles ur
+    INNER JOIN workforce w
+        ON (
+            -- Membership: managementview node in any level column
+            -- '*' short-circuits → every workforce row passes
+               ARRAY_CONTAINS(ur.managementview, '*')
+            OR ARRAY_CONTAINS(ur.managementview, w.level1_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level2_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level3_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level4_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level5_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level6_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level7_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level8_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level9_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level10_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level11_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level12_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level13_node)
+            OR ARRAY_CONTAINS(ur.managementview, w.level14_node)
+        )
+    WHERE 
+        ur.is_manager = FALSE
+        -- Dimensional: each column short-circuits on '*'
+        AND (ARRAY_CONTAINS(ur.country,     '*') OR ARRAY_CONTAINS(ur.country,     w.country))
+        AND (ARRAY_CONTAINS(ur.sbmod,       '*') OR ARRAY_CONTAINS(ur.sbmod,       w.sbmod))
+        AND (ARRAY_CONTAINS(ur.division,    '*') OR ARRAY_CONTAINS(ur.division,    w.division))
+        AND (ARRAY_CONTAINS(ur.jobgroup,    '*') OR ARRAY_CONTAINS(ur.jobgroup,    w.jobgroup))
+        AND (ARRAY_CONTAINS(ur.companycode, '*') OR ARRAY_CONTAINS(ur.companycode, w.companycode))
+),
+
+
+-- ============================================================
+-- STEP 2: Manager node depth discovery (inline, no lookup table)
+--
+-- Explode managementview nodes (~5 per role)
+-- Find depth of each node from workforce itself
+-- Skip '*' nodes (handled by wildcard short-circuit)
+-- Result: ~25 rows with (mv_node, mv_node_depth)
+--
+-- Cost: one workforce scan, 100K × 14 ORs × ~5 nodes
+--       = 7M comparisons. Sub-second.
+-- ============================================================
+mgmt_nodes_with_depth AS (
+    SELECT 
+        ur.email,
+        ur.role,
+        ur.role_description,
+        ur.managementview,
+        ur.country,
+        ur.sbmod,
+        ur.division,
+        ur.jobgroup,
+        ur.companycode,
+        mv_node,
+        MIN(CASE 
+            WHEN w.level1_node  = mv_node THEN 1
+            WHEN w.level2_node  = mv_node THEN 2
+            WHEN w.level3_node  = mv_node THEN 3
+            WHEN w.level4_node  = mv_node THEN 4
+            WHEN w.level5_node  = mv_node THEN 5
+            WHEN w.level6_node  = mv_node THEN 6
+            WHEN w.level7_node  = mv_node THEN 7
+            WHEN w.level8_node  = mv_node THEN 8
+            WHEN w.level9_node  = mv_node THEN 9
+            WHEN w.level10_node = mv_node THEN 10
+            WHEN w.level11_node = mv_node THEN 11
+            WHEN w.level12_node = mv_node THEN 12
+            WHEN w.level13_node = mv_node THEN 13
+            WHEN w.level14_node = mv_node THEN 14
+        END) AS mv_node_depth
+    FROM user_roles ur
+    LATERAL VIEW EXPLODE(ur.managementview) mv AS mv_node
+    INNER JOIN workforce w
+        ON w.level1_node  = mv_node OR w.level2_node  = mv_node
+        OR w.level3_node  = mv_node OR w.level4_node  = mv_node
+        OR w.level5_node  = mv_node OR w.level6_node  = mv_node
+        OR w.level7_node  = mv_node OR w.level8_node  = mv_node
+        OR w.level9_node  = mv_node OR w.level10_node = mv_node
+        OR w.level11_node = mv_node OR w.level12_node = mv_node
+        OR w.level13_node = mv_node OR w.level14_node = mv_node
+    WHERE ur.is_manager = TRUE
+      AND mv_node != '*'
+    GROUP BY 
+        ur.email, ur.role, ur.role_description,
+        ur.managementview, ur.country, ur.sbmod, 
+        ur.division, ur.jobgroup, ur.companycode,
+        mv_node
+),
+
+
+-- ============================================================
+-- TIER 2: Manager — membership + 4-level mgmt view + dimensional
+--
+-- Logic for managers:
+--   Step A: Membership — node_id exists in one of 14 level columns
+--           Same ARRAY_CONTAINS pattern as non-manager.
+--           '*' in managementview short-circuits here too.
+--
+--   Step B: Management view restriction — 
+--           w.managementview (workforce column) must MATCH
+--           a level column value within 4 levels below user's node.
+--           Direct comparison with range guard per column.
+--
+--   Step C: Dimensional — same ARRAY_CONTAINS with '*' short-circuit
+--
+-- DISTINCT handles duplicate IPINs from multiple matching nodes.
+-- ============================================================
+manager_result AS (
+    SELECT DISTINCT
+        w.*,
+        mnd.role,
+        mnd.role_description
+    FROM mgmt_nodes_with_depth mnd
+    INNER JOIN workforce w
+        ON (
+            -- Step A: Membership — node exists in 14 level columns
+            -- Same as non-manager, uses full managementview array
+               ARRAY_CONTAINS(mnd.managementview, '*')
+            OR ARRAY_CONTAINS(mnd.managementview, w.level1_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level2_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level3_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level4_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level5_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level6_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level7_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level8_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level9_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level10_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level11_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level12_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level13_node)
+            OR ARRAY_CONTAINS(mnd.managementview, w.level14_node)
+        )
+    WHERE 
+        -- Step B: Management view 4-level restriction
+        -- w.managementview (workforce column) must match
+        -- a level column value within 4 levels below user's node depth
+        (
+               (w.managementview = w.level1_node  AND 1  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level2_node  AND 2  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level3_node  AND 3  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level4_node  AND 4  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level5_node  AND 5  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level6_node  AND 6  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level7_node  AND 7  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level8_node  AND 8  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level9_node  AND 9  BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level10_node AND 10 BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level11_node AND 11 BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level12_node AND 12 BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level13_node AND 13 BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+            OR (w.managementview = w.level14_node AND 14 BETWEEN mnd.mv_node_depth AND mnd.mv_node_depth + 4)
+        )
+
+        -- Step C: Dimensional — '*' short-circuits per column
+        AND (ARRAY_CONTAINS(mnd.country,     '*') OR ARRAY_CONTAINS(mnd.country,     w.country))
+        AND (ARRAY_CONTAINS(mnd.sbmod,       '*') OR ARRAY_CONTAINS(mnd.sbmod,       w.sbmod))
+        AND (ARRAY_CONTAINS(mnd.division,    '*') OR ARRAY_CONTAINS(mnd.division,    w.division))
+        AND (ARRAY_CONTAINS(mnd.jobgroup,    '*') OR ARRAY_CONTAINS(mnd.jobgroup,    w.jobgroup))
+        AND (ARRAY_CONTAINS(mnd.companycode, '*') OR ARRAY_CONTAINS(mnd.companycode, w.companycode))
+)
+
+
+-- ============================================================
+-- FINAL
+-- ============================================================
+SELECT * FROM nonmanager_result
+UNION ALL
+SELECT * FROM manager_result;
