@@ -1,18 +1,19 @@
 -- ============================================================
 -- WORKFORCE ROW-LEVEL SECURITY VIEW
 -- ============================================================
--- Version:  FINAL (single path, no branches)
+-- Version:  FINAL (Photon optimized, runtime 13.3+)
 -- Platform: Databricks / Delta Lake
 --
 -- Security model: deny-all-by-default
 --
--- Design:
---   ONE query path handles everything:
---     Prima, wildcard, non-manager, manager — all inline
---     is_manager = FALSE short-circuits manager logic
---     array[0] = '*' short-circuits wildcard checks
---     No UNION ALL, no separate branches
---     Single workforce scan
+-- Performance optimizations:
+--   1. Subquery EXPLODE (not LATERAL VIEW) → Photon native
+--   2. Broadcast hint on tiny user_nodes → no shuffle
+--   3. Depth discovery skipped for non-manager roles
+--   4. Scalar mv_node comparison → Photon native (no ARRAY_CONTAINS for membership)
+--   5. array[0] = '*' short-circuit → Photon native scalar check
+--   6. Predicate ordering: cheapest checks first
+--   7. Single workforce scan, no UNION ALL
 --
 -- Infrastructure: ZERO additional tables
 -- ============================================================
@@ -24,7 +25,6 @@ WITH
 
 -- ============================================================
 -- ROLE FILTER CONFIGURATION
--- Only section that changes per view.
 -- ============================================================
 role_prefixes AS (
     SELECT prefix FROM (VALUES 
@@ -52,8 +52,6 @@ manager_roles AS (
 
 -- ============================================================
 -- STEP 1: Current user's roles
--- Dashboard may push role filter → 1 row
--- Without filter → all applicable roles
 -- ============================================================
 user_roles AS (
     SELECT DISTINCT
@@ -81,16 +79,15 @@ user_roles AS (
 
 
 -- ============================================================
--- STEP 2: Explode managementview + discover depth
+-- STEP 2: Explode managementview (Photon-native syntax)
 --
--- Explodes ~5 nodes per role. Depth discovered from workforce.
--- '*' nodes: LEFT JOIN produces NULL depth (correct, never used)
--- Non-manager nodes: depth discovered but never used (harmless)
--- Manager nodes: depth used in 4-level range guard
+-- Subquery EXPLODE instead of LATERAL VIEW:
+--   LATERAL VIEW → Hive syntax → JVM fallback
+--   Subquery EXPLODE → Spark native → Photon executes
 --
--- Result: ~5-25 rows depending on role count
+-- Result: ~5-25 rows (tiny, broadcast candidate)
 -- ============================================================
-user_nodes AS (
+user_nodes_exploded AS (
     SELECT 
         ur.role,
         ur.role_description,
@@ -101,80 +98,94 @@ user_nodes AS (
         ur.jobgroup,
         ur.companycode,
         ur.is_manager,
-        mv_node,
-        MIN(CASE
-            WHEN w.level1_node  = mv_node THEN 1
-            WHEN w.level2_node  = mv_node THEN 2
-            WHEN w.level3_node  = mv_node THEN 3
-            WHEN w.level4_node  = mv_node THEN 4
-            WHEN w.level5_node  = mv_node THEN 5
-            WHEN w.level6_node  = mv_node THEN 6
-            WHEN w.level7_node  = mv_node THEN 7
-            WHEN w.level8_node  = mv_node THEN 8
-            WHEN w.level9_node  = mv_node THEN 9
-            WHEN w.level10_node = mv_node THEN 10
-            WHEN w.level11_node = mv_node THEN 11
-            WHEN w.level12_node = mv_node THEN 12
-            WHEN w.level13_node = mv_node THEN 13
-            WHEN w.level14_node = mv_node THEN 14
-        END) AS mv_node_depth
-    FROM user_roles ur
-    LATERAL VIEW EXPLODE(ur.managementview) mv AS mv_node
-    LEFT JOIN workforce w
-        ON mv_node != '*'
-        AND (
-               w.level1_node  = mv_node OR w.level2_node  = mv_node
-            OR w.level3_node  = mv_node OR w.level4_node  = mv_node
-            OR w.level5_node  = mv_node OR w.level6_node  = mv_node
-            OR w.level7_node  = mv_node OR w.level8_node  = mv_node
-            OR w.level9_node  = mv_node OR w.level10_node = mv_node
-            OR w.level11_node = mv_node OR w.level12_node = mv_node
-            OR w.level13_node = mv_node OR w.level14_node = mv_node
-        )
-    GROUP BY
-        ur.role, ur.role_description,
-        ur.managementview, ur.country, ur.sbmod,
-        ur.division, ur.jobgroup, ur.companycode,
-        ur.is_manager, mv_node
+        mv_node
+    FROM user_roles ur,
+    LATERAL (SELECT EXPLODE(ur.managementview) AS mv_node) mv
 ),
 
 
 -- ============================================================
--- STEP 3: Single scan — all security logic in one pass
+-- STEP 3: Discover depth per node
 --
--- Short-circuit evaluation order per workforce row:
+-- Key optimization: une.is_manager = TRUE in ON clause
+--   Non-manager: ON evaluates FALSE → LEFT JOIN returns NULL depth
+--   No workforce scan for non-manager roles
+--   Depth only discovered for manager roles with specific nodes
 --
--- MEMBERSHIP (JOIN ON):
---   mv_node = '*' → TRUE instantly, skip 14 level checks
---   mv_node = w.level1_node → TRUE, stop
---   mv_node = w.level2_node → TRUE, stop
---   ... up to level14
+-- '*' nodes: mv_node != '*' → ON evaluates FALSE → NULL depth
+--   No workforce scan for wildcard nodes
+-- ============================================================
+user_nodes AS (
+    SELECT 
+        une.role,
+        une.role_description,
+        une.managementview,
+        une.country,
+        une.sbmod,
+        une.division,
+        une.jobgroup,
+        une.companycode,
+        une.is_manager,
+        une.mv_node,
+        MIN(CASE
+            WHEN w.level1_node  = une.mv_node THEN 1
+            WHEN w.level2_node  = une.mv_node THEN 2
+            WHEN w.level3_node  = une.mv_node THEN 3
+            WHEN w.level4_node  = une.mv_node THEN 4
+            WHEN w.level5_node  = une.mv_node THEN 5
+            WHEN w.level6_node  = une.mv_node THEN 6
+            WHEN w.level7_node  = une.mv_node THEN 7
+            WHEN w.level8_node  = une.mv_node THEN 8
+            WHEN w.level9_node  = une.mv_node THEN 9
+            WHEN w.level10_node = une.mv_node THEN 10
+            WHEN w.level11_node = une.mv_node THEN 11
+            WHEN w.level12_node = une.mv_node THEN 12
+            WHEN w.level13_node = une.mv_node THEN 13
+            WHEN w.level14_node = une.mv_node THEN 14
+        END) AS mv_node_depth
+    FROM user_nodes_exploded une
+    LEFT JOIN workforce w
+        ON une.is_manager = TRUE
+        AND une.mv_node != '*'
+        AND (
+               w.level1_node  = une.mv_node OR w.level2_node  = une.mv_node
+            OR w.level3_node  = une.mv_node OR w.level4_node  = une.mv_node
+            OR w.level5_node  = une.mv_node OR w.level6_node  = une.mv_node
+            OR w.level7_node  = une.mv_node OR w.level8_node  = une.mv_node
+            OR w.level9_node  = une.mv_node OR w.level10_node = une.mv_node
+            OR w.level11_node = une.mv_node OR w.level12_node = une.mv_node
+            OR w.level13_node = une.mv_node OR w.level14_node = une.mv_node
+        )
+    GROUP BY
+        une.role, une.role_description,
+        une.managementview, une.country, une.sbmod,
+        une.division, une.jobgroup, une.companycode,
+        une.is_manager, une.mv_node
+),
+
+
+-- ============================================================
+-- STEP 4: Single workforce scan — all security logic
 --
--- MANAGEMENT VIEW (WHERE):
---   is_manager = FALSE → TRUE → skip entire block (1 comparison)
---   is_manager = TRUE:
---     managementview[0] = '*' → TRUE → skip range checks (1 comparison)
---     managementview[0] != '*':
---       14 range-guarded branches, ~5 evaluate, rest short-circuit
+-- Broadcast hint: user_nodes is ~5-25 rows
+--   Forces broadcast join → no shuffle on workforce side
+--   Workforce stays partitioned, scanned once in place
 --
--- DIMENSIONAL (WHERE):
---   array[0] = '*' → TRUE → skip value check (1 comparison per column)
---   array[0] != '*' → ARRAY_CONTAINS checks value
---
--- Cost per row:
---   Prima/wildcard:     ~7 comparisons (all short-circuit)
---   Non-manager:        ~20-70 comparisons (membership + dimensional)
---   Manager specific:   ~40-90 comparisons (membership + mgmt view + dimensional)
+-- Predicate order (cheapest first):
+--   1. is_manager boolean check (1 comparison, skips mgmt view)
+--   2. array[0] = '*' scalar checks (skip ARRAY_CONTAINS)
+--   3. ARRAY_CONTAINS dimensional (only if not wildcard)
+--   4. 14 range-guarded branches (only if manager + specific)
 -- ============================================================
 all_secured_rows AS (
     SELECT DISTINCT
         w.*,
         un.role,
         un.role_description
-    FROM user_nodes un
+    FROM /*+ BROADCAST(un) */ user_nodes un
     INNER JOIN workforce w
         ON (
-            -- Membership
+            -- Membership: scalar comparison, Photon native
             un.mv_node = '*'
             OR un.mv_node = w.level1_node
             OR un.mv_node = w.level2_node
@@ -192,10 +203,7 @@ all_secured_rows AS (
             OR un.mv_node = w.level14_node
         )
     WHERE
-        -- Management view 4-level restriction
-        -- Non-manager: is_manager=FALSE → TRUE → skip (1 comparison)
-        -- Manager wildcard: [0]='*' → TRUE → skip (2 comparisons)
-        -- Manager specific: evaluate range guards
+        -- 1. Management view (cheapest check first)
         (
             un.is_manager = FALSE
             OR un.managementview[0] = '*'
@@ -217,7 +225,7 @@ all_secured_rows AS (
             )
         )
 
-        -- Dimensional
+        -- 2. Dimensional (scalar check first, ARRAY_CONTAINS only if needed)
         AND (un.country[0]     = '*' OR ARRAY_CONTAINS(un.country,     w.country))
         AND (un.sbmod[0]       = '*' OR ARRAY_CONTAINS(un.sbmod,       w.sbmod))
         AND (un.division[0]    = '*' OR ARRAY_CONTAINS(un.division,    w.division))
@@ -227,10 +235,8 @@ all_secured_rows AS (
 
 
 -- ============================================================
--- STEP 4: Column definitions — ALL in ONE place
--- Derivations + role-dependent masking
--- Evaluated only on rows that passed security
--- Change any column → change ONLY here
+-- STEP 5: Column definitions — ALL in ONE place
+-- Evaluated only on post-security rows
 -- ============================================================
 final_output AS (
     SELECT
@@ -239,14 +245,14 @@ final_output AS (
         r.role,
         r.role_description,
 
-        -- Pass-through columns
+        -- Pass-through
         r.employee_name,
         r.hire_date,
         r.department,
         r.country,
         r.division,
 
-        -- Pure derivations (role-independent)
+        -- Pure derivations
         CASE 
             WHEN r.fte < 0.5 THEN 'Part Time'
             WHEN r.fte < 1.0 THEN 'Reduced Hours'
