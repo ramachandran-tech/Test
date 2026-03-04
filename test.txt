@@ -1,40 +1,13 @@
--- ============================================================
--- WORKFORCE ROW-LEVEL SECURITY VIEW
--- ============================================================
--- Version:  FINAL (Photon optimized, runtime 13.3+)
--- Platform: Databricks / Delta Lake
---
--- Security model: deny-all-by-default
---
--- Performance optimizations:
---   1. Subquery EXPLODE (not LATERAL VIEW) → Photon native
---   2. Broadcast hint on tiny user_nodes → no shuffle
---   3. Depth discovery skipped for non-manager roles
---   4. Scalar mv_node comparison → Photon native (no ARRAY_CONTAINS for membership)
---   5. array[0] = '*' short-circuit → Photon native scalar check
---   6. Predicate ordering: cheapest checks first
---   7. Single workforce scan, no UNION ALL
---
--- Infrastructure: ZERO additional tables
--- ============================================================
-
-
-CREATE OR REPLACE VIEW workforce_secured AS
-
 WITH
-
--- ============================================================
--- ROLE FILTER CONFIGURATION
--- ============================================================
 role_prefixes AS (
-    SELECT prefix FROM (VALUES 
+    SELECT prefix FROM (VALUES
         ('XXAHR6A'), ('XXAHR6B'), ('XXGBP0A'), ('XXLBP0A'),
         ('XXINA0A'), ('XXLCB4A'), ('XXMANDA')
     ) AS t(prefix)
 ),
 
 role_exact AS (
-    SELECT role_name FROM (VALUES 
+    SELECT role_name FROM (VALUES
         ('XXCBP0AC'), ('XXGCB0AJ'), ('XX8001RX'), ('XXCCB4AA'),
         ('XXCRD2AX'), ('XXCTM3AX'), ('XXGC04AA'), ('XXSMA0AX'),
         ('XXSW1AX'), ('DEVELOPER'), ('ANALYST')
@@ -42,17 +15,13 @@ role_exact AS (
 ),
 
 manager_roles AS (
-    SELECT role_name FROM (VALUES 
+    SELECT role_name FROM (VALUES
         ('XXAHR6A1'),
         ('XXAHR6A2'),
         ('XXMANDAX')
     ) AS t(role_name)
 ),
 
-
--- ============================================================
--- STEP 1: Current user's roles
--- ============================================================
 user_roles AS (
     SELECT DISTINCT
         ur.email,
@@ -77,18 +46,8 @@ user_roles AS (
       )
 ),
 
-
--- ============================================================
--- STEP 2: Explode managementview (Photon-native syntax)
---
--- Subquery EXPLODE instead of LATERAL VIEW:
---   LATERAL VIEW → Hive syntax → JVM fallback
---   Subquery EXPLODE → Spark native → Photon executes
---
--- Result: ~5-25 rows (tiny, broadcast candidate)
--- ============================================================
 user_nodes_exploded AS (
-    SELECT 
+    SELECT
         ur.role,
         ur.role_description,
         ur.managementview,
@@ -103,20 +62,17 @@ user_nodes_exploded AS (
     LATERAL (SELECT EXPLODE(ur.managementview) AS mv_node) mv
 ),
 
+user_nodes_wildcard AS (
+    SELECT
+        role, role_description, managementview,
+        country, sbmod, division, jobgroup, companycode,
+        is_manager
+    FROM user_nodes_exploded
+    WHERE mv_node = '*'
+),
 
--- ============================================================
--- STEP 3: Discover depth per node
---
--- Key optimization: une.is_manager = TRUE in ON clause
---   Non-manager: ON evaluates FALSE → LEFT JOIN returns NULL depth
---   No workforce scan for non-manager roles
---   Depth only discovered for manager roles with specific nodes
---
--- '*' nodes: mv_node != '*' → ON evaluates FALSE → NULL depth
---   No workforce scan for wildcard nodes
--- ============================================================
-user_nodes AS (
-    SELECT 
+user_nodes_specific AS (
+    SELECT
         une.role,
         une.role_description,
         une.managementview,
@@ -127,35 +83,32 @@ user_nodes AS (
         une.companycode,
         une.is_manager,
         une.mv_node,
-        MIN(CASE
-            WHEN w.level1_node  = une.mv_node THEN 1
-            WHEN w.level2_node  = une.mv_node THEN 2
-            WHEN w.level3_node  = une.mv_node THEN 3
-            WHEN w.level4_node  = une.mv_node THEN 4
-            WHEN w.level5_node  = une.mv_node THEN 5
-            WHEN w.level6_node  = une.mv_node THEN 6
-            WHEN w.level7_node  = une.mv_node THEN 7
-            WHEN w.level8_node  = une.mv_node THEN 8
-            WHEN w.level9_node  = une.mv_node THEN 9
-            WHEN w.level10_node = une.mv_node THEN 10
-            WHEN w.level11_node = une.mv_node THEN 11
-            WHEN w.level12_node = une.mv_node THEN 12
-            WHEN w.level13_node = une.mv_node THEN 13
-            WHEN w.level14_node = une.mv_node THEN 14
-        END) AS mv_node_depth
+        MIN(
+            ARRAY_POSITION(
+                ARRAY(
+                    w.level1_node,  w.level2_node,  w.level3_node,
+                    w.level4_node,  w.level5_node,  w.level6_node,
+                    w.level7_node,  w.level8_node,  w.level9_node,
+                    w.level10_node, w.level11_node, w.level12_node,
+                    w.level13_node, w.level14_node
+                ),
+                une.mv_node
+            )
+        ) AS mv_node_depth
     FROM user_nodes_exploded une
     LEFT JOIN workforce w
         ON une.is_manager = TRUE
-        AND une.mv_node != '*'
-        AND (
-               w.level1_node  = une.mv_node OR w.level2_node  = une.mv_node
-            OR w.level3_node  = une.mv_node OR w.level4_node  = une.mv_node
-            OR w.level5_node  = une.mv_node OR w.level6_node  = une.mv_node
-            OR w.level7_node  = une.mv_node OR w.level8_node  = une.mv_node
-            OR w.level9_node  = une.mv_node OR w.level10_node = une.mv_node
-            OR w.level11_node = une.mv_node OR w.level12_node = une.mv_node
-            OR w.level13_node = une.mv_node OR w.level14_node = une.mv_node
-        )
+        AND ARRAY_CONTAINS(
+                ARRAY(
+                    w.level1_node,  w.level2_node,  w.level3_node,
+                    w.level4_node,  w.level5_node,  w.level6_node,
+                    w.level7_node,  w.level8_node,  w.level9_node,
+                    w.level10_node, w.level11_node, w.level12_node,
+                    w.level13_node, w.level14_node
+                ),
+                une.mv_node
+            )
+    WHERE une.mv_node != '*'
     GROUP BY
         une.role, une.role_description,
         une.managementview, une.country, une.sbmod,
@@ -163,136 +116,78 @@ user_nodes AS (
         une.is_manager, une.mv_node
 ),
 
+wildcard_rows AS (
+    SELECT
+        w.*,
+        uw.role,
+        uw.role_description
+    FROM /*+ BROADCAST(uw) */ user_nodes_wildcard uw
+    INNER JOIN workforce w
+        ON TRUE
+    WHERE
+        (uw.country[0]     = '*' OR ARRAY_CONTAINS(uw.country,     w.country))
+        AND (uw.sbmod[0]       = '*' OR ARRAY_CONTAINS(uw.sbmod,       w.sbmod))
+        AND (uw.division[0]    = '*' OR ARRAY_CONTAINS(uw.division,    w.division))
+        AND (uw.jobgroup[0]    = '*' OR ARRAY_CONTAINS(uw.jobgroup,    w.jobgroup))
+        AND (uw.companycode[0] = '*' OR ARRAY_CONTAINS(uw.companycode, w.companycode))
+),
 
--- ============================================================
--- STEP 4: Single workforce scan — all security logic
---
--- Broadcast hint: user_nodes is ~5-25 rows
---   Forces broadcast join → no shuffle on workforce side
---   Workforce stays partitioned, scanned once in place
---
--- Predicate order (cheapest first):
---   1. is_manager boolean check (1 comparison, skips mgmt view)
---   2. array[0] = '*' scalar checks (skip ARRAY_CONTAINS)
---   3. ARRAY_CONTAINS dimensional (only if not wildcard)
---   4. 14 range-guarded branches (only if manager + specific)
--- ============================================================
-all_secured_rows AS (
+specific_rows AS (
     SELECT DISTINCT
         w.*,
-        un.role,
-        un.role_description
-    FROM /*+ BROADCAST(un) */ user_nodes un
+        us.role,
+        us.role_description
+    FROM /*+ BROADCAST(us) */ user_nodes_specific us
     INNER JOIN workforce w
-        ON (
-            -- Membership: scalar comparison, Photon native
-            un.mv_node = '*'
-            OR un.mv_node = w.level1_node
-            OR un.mv_node = w.level2_node
-            OR un.mv_node = w.level3_node
-            OR un.mv_node = w.level4_node
-            OR un.mv_node = w.level5_node
-            OR un.mv_node = w.level6_node
-            OR un.mv_node = w.level7_node
-            OR un.mv_node = w.level8_node
-            OR un.mv_node = w.level9_node
-            OR un.mv_node = w.level10_node
-            OR un.mv_node = w.level11_node
-            OR un.mv_node = w.level12_node
-            OR un.mv_node = w.level13_node
-            OR un.mv_node = w.level14_node
+        ON ARRAY_CONTAINS(
+            ARRAY(
+                w.level1_node,  w.level2_node,  w.level3_node,
+                w.level4_node,  w.level5_node,  w.level6_node,
+                w.level7_node,  w.level8_node,  w.level9_node,
+                w.level10_node, w.level11_node, w.level12_node,
+                w.level13_node, w.level14_node
+            ),
+            us.mv_node
         )
     WHERE
-        -- 1. Management view (cheapest check first)
+        -- Management view 4-level restriction
         (
-            un.is_manager = FALSE
-            OR un.managementview[0] = '*'
+            us.is_manager = FALSE
             OR (
-                   (w.managementview = w.level1_node  AND 1  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level2_node  AND 2  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level3_node  AND 3  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level4_node  AND 4  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level5_node  AND 5  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level6_node  AND 6  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level7_node  AND 7  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level8_node  AND 8  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level9_node  AND 9  BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level10_node AND 10 BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level11_node AND 11 BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level12_node AND 12 BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level13_node AND 13 BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
-                OR (w.managementview = w.level14_node AND 14 BETWEEN un.mv_node_depth AND un.mv_node_depth + 4)
+                us.mv_node_depth IS NOT NULL
+                AND ARRAY_CONTAINS(
+                    SLICE(
+                        ARRAY(
+                            w.level1_node,  w.level2_node,  w.level3_node,
+                            w.level4_node,  w.level5_node,  w.level6_node,
+                            w.level7_node,  w.level8_node,  w.level9_node,
+                            w.level10_node, w.level11_node, w.level12_node,
+                            w.level13_node, w.level14_node
+                        ),
+                        us.mv_node_depth,
+                        5
+                    ),
+                    w.managementview
+                )
             )
         )
 
-        -- 2. Dimensional (scalar check first, ARRAY_CONTAINS only if needed)
-        AND (un.country[0]     = '*' OR ARRAY_CONTAINS(un.country,     w.country))
-        AND (un.sbmod[0]       = '*' OR ARRAY_CONTAINS(un.sbmod,       w.sbmod))
-        AND (un.division[0]    = '*' OR ARRAY_CONTAINS(un.division,    w.division))
-        AND (un.jobgroup[0]    = '*' OR ARRAY_CONTAINS(un.jobgroup,    w.jobgroup))
-        AND (un.companycode[0] = '*' OR ARRAY_CONTAINS(un.companycode, w.companycode))
+        -- Dimensional
+        AND (us.country[0]     = '*' OR ARRAY_CONTAINS(us.country,     w.country))
+        AND (us.sbmod[0]       = '*' OR ARRAY_CONTAINS(us.sbmod,       w.sbmod))
+        AND (us.division[0]    = '*' OR ARRAY_CONTAINS(us.division,    w.division))
+        AND (us.jobgroup[0]    = '*' OR ARRAY_CONTAINS(us.jobgroup,    w.jobgroup))
+        AND (us.companycode[0] = '*' OR ARRAY_CONTAINS(us.companycode, w.companycode))
 ),
 
+all_secured_rows AS (
+    SELECT * FROM wildcard_rows
+    UNION ALL
+    SELECT * FROM specific_rows
+),
 
--- ============================================================
--- STEP 5: Column definitions — ALL in ONE place
--- Evaluated only on post-security rows
--- ============================================================
 final_output AS (
-    SELECT
-        r.ipin,
-        r.snapshotdate,
-        r.role,
-        r.role_description,
-
-        -- Pass-through
-        r.employee_name,
-        r.hire_date,
-        r.department,
-        r.country,
-        r.division,
-
-        -- Pure derivations
-        CASE 
-            WHEN r.fte < 0.5 THEN 'Part Time'
-            WHEN r.fte < 1.0 THEN 'Reduced Hours'
-            ELSE 'Full Time'
-        END AS fte_category,
-
-        COALESCE(r.cost_center, r.department_code, 'UNKNOWN') AS resolved_cost_center,
-
-        CASE 
-            WHEN r.termination_date IS NOT NULL 
-             AND r.termination_date <= r.snapshotdate 
-            THEN 'Terminated'
-            WHEN r.leave_start IS NOT NULL AND r.leave_end IS NULL 
-            THEN 'On Leave'
-            ELSE 'Active'
-        END AS derived_status,
-
-        -- Role-dependent masking
-        CASE 
-            WHEN r.role IN ('XXAHR6A1', 'XXLBP0A1') THEN ''
-            ELSE r.gender 
-        END AS gender,
-
-        CASE 
-            WHEN r.role IN ('XXAHR6A1', 'XXLBP0A1', 'ANALYST') THEN NULL
-            ELSE r.salary 
-        END AS salary,
-
-        CASE 
-            WHEN r.role NOT IN ('XXGCB0AJ', 'DEVELOPER') THEN NULL
-            ELSE r.date_of_birth 
-        END AS date_of_birth,
-
-        CASE 
-            WHEN r.role LIKE 'XXAHR6%' THEN r.personal_email
-            ELSE ''
-        END AS personal_email
-
-        -- ... remaining columns ...
-
+    SELECT *
     FROM all_secured_rows r
 )
 
