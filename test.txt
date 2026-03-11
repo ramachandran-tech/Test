@@ -1,5 +1,3 @@
-CREATE OR REPLACE VIEW workforce_secured AS
-
 WITH
 role_prefixes AS (
     SELECT prefix FROM (VALUES
