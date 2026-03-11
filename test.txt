@@ -1,4 +1,28 @@
+CREATE OR REPLACE VIEW workforce_secured AS
+
 WITH
+role_prefixes AS (
+    SELECT prefix FROM (VALUES
+        ('XXAHR6A'), ('XXAHR6B'), ('XXGBP0A'), ('XXLBP0A'),
+        ('XXINA0A'), ('XXLCB4A'), ('XXMANDA')
+    ) AS t(prefix)
+),
+
+role_exact AS (
+    SELECT role_name FROM (VALUES
+        ('XXCBP0AC'), ('XXGCB0AJ'), ('XX8001RX'), ('XXCCB4AA'),
+        ('XXCRD2AX'), ('XXCTM3AX'), ('XXGC04AA'), ('XXSMA0AX'),
+        ('XXSW1AX'), ('DEVELOPER'), ('ANALYST')
+    ) AS t(role_name)
+),
+
+manager_roles AS (
+    SELECT role_name FROM (VALUES
+        ('XXAHR6A1'),
+        ('XXAHR6A2'),
+        ('XXMANDAX')
+    ) AS t(role_name)
+),
 
 user_roles AS (
     SELECT DISTINCT
@@ -12,14 +36,14 @@ user_roles AS (
         ur.jobgroup,
         ur.companycode,
         CASE WHEN mr.role_name IS NOT NULL THEN TRUE ELSE FALSE END AS is_manager
-    FROM userrole_tab ur
+    FROM securedbt_hr.hr_sec_userrole ur
     LEFT JOIN manager_roles mr ON ur.role = mr.role_name
     WHERE ur.email = current_user()
       AND (
           ur.role IN (SELECT role_name FROM role_exact)
           OR EXISTS (
               SELECT 1 FROM role_prefixes rp
-              WHERE ur.role LIKE CONCAT(rp.prefix, '%')
+              WHERE startswith(ur.role, rp.prefix)
           )
       )
 ),
@@ -42,10 +66,10 @@ user_nodes AS (
 
 all_secured_rows AS (
     SELECT DISTINCT
+        w.*,
         un.role,
-        un.role_description,
-		w.*
-    FROM /* + BROADCAST(un) */ user_nodes un
+        un.role_description
+    FROM /*+ BROADCAST(un) */ user_nodes un
     INNER JOIN workforce w
         ON (
             un.mv_node = '*'
@@ -61,8 +85,6 @@ all_secured_rows AS (
             )
         )
     WHERE
-        -- Management view 4-level restriction
-        -- is_manager first: majority are non-managers → 1 boolean skip
         (
             un.is_manager = FALSE
             OR un.managementview[0] = '*'
@@ -102,8 +124,6 @@ all_secured_rows AS (
                 )
             )
         )
-
-        -- Dimensional
         AND (un.country[0]     = '*' OR ARRAY_CONTAINS(un.country,     w.country))
         AND (un.sbmod[0]       = '*' OR ARRAY_CONTAINS(un.sbmod,       w.sbmod))
         AND (un.division[0]    = '*' OR ARRAY_CONTAINS(un.division,    w.division))
